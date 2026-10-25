@@ -104,7 +104,7 @@ from backend.app.core.database import async_session, engine, init_db
 from backend.app.core.static_assets import AssetStaticFiles
 from backend.app.core.tasks import spawn_background_task
 from backend.app.core.websocket import ws_manager
-from backend.app.services import kprofile_drift, print_dispatch_context, slot_unlink_grace
+from backend.app.services import kprofile_drift, pause_eta, print_dispatch_context, slot_unlink_grace
 from backend.app.services.ams_assignment_lock import get_ams_assignment_lock
 from backend.app.services.archive import ArchiveService, peek_plate_index_in_3mf, swap_plate_suffix
 from backend.app.services.archive_cost_estimate import (
@@ -1894,6 +1894,10 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
         notify_live_activities.observe(printer_id, state)
     except Exception:
         logging.getLogger(__name__).exception("Notify Live Activity status hook failed for printer %s", printer_id)
+    try:
+        pause_eta.observe(printer_id, state)
+    except Exception:
+        logging.getLogger(__name__).exception("Pause heads-up check failed for printer %s", printer_id)
     # Connected-edge reconciliation (#1542 follow-up). When the printer
     # transitions disconnected → connected — which covers both Bambuddy
     # startup (no prior connection) and a mid-session MQTT reconnect — fire
@@ -3808,6 +3812,65 @@ def _load_objects_from_archive(archive, printer_id: int, logger) -> None:
         logger.debug("Failed to extract printable objects from archive: %s", e)
 
 
+def _load_pauses_from_3mf(threemf_path, printer_id: int, *, warned_layers=(), passed_through_layer: int = 0) -> None:
+    """Read the running print's slicer pauses from its 3MF, in the background (#2984).
+
+    In a thread: a plate's G-code runs to tens of MB, and the print-start
+    handler must not wait for it. Kept only while the printer is still on
+    the print they were read for: a new print replaces the list.
+    ``warned_layers``: pauses this print was already warned about, kept on its
+    archive, so a restart does not send the heads-up again.
+    ``passed_through_layer``: for a print resumed after a restart, the layer it
+    is on. Its pauses up to there are behind it, though the printer's layer
+    reads 0 until it reports the next one.
+    """
+    client = printer_manager.get_client(printer_id)
+    if not client:
+        return
+    state = client.state
+    read_for = state.pause_points
+    try:
+        plate_id = resolve_plate_id(state)
+    except Exception:
+        # Never at the cost of the print-start handler this runs inside.
+        logging.getLogger(__name__).warning("[Printer %s] Could not tell the plate to read pauses for", printer_id)
+        return
+
+    async def _load() -> None:
+        from backend.app.utils.threemf_tools import extract_pause_points_from_3mf
+
+        points = await asyncio.to_thread(extract_pause_points_from_3mf, Path(threemf_path), plate_id)
+        if state.pause_points is not read_for:
+            return
+        state.pause_points = [p for p in points if p.layer > passed_through_layer]
+        state.pause_warned_layers = set(state.pause_warned_layers) | set(warned_layers)
+        if points:
+            logging.getLogger(__name__).info(
+                "Loaded %s slicer pause(s) for printer %s at layer(s) %s",
+                len(points),
+                printer_id,
+                [p.layer for p in points],
+            )
+
+    spawn_background_task(_load(), name=f"load-pauses-{printer_id}")
+
+
+def _load_pauses_from_resumed_archive(archive, printer_id: int) -> None:
+    """Pauses for a print start taken as the resumption of a running print.
+
+    A restart while the print was paused makes its resume look like a new
+    print (#2984): the pauses warned about and passed are kept from before.
+    """
+    client = printer_manager.get_client(printer_id)
+    state = client.state if client else None
+    _load_pauses_from_3mf(
+        app_settings.base_dir / archive.file_path,
+        printer_id,
+        warned_layers=pause_eta.warned_layers_of(archive, state) if state is not None else (),
+        passed_through_layer=getattr(client, "layer_before_new_print", 0) if client else 0,
+    )
+
+
 async def _restore_printable_objects(printer_id: int, state, db, logger) -> None:
     """Put the skip-objects list back after a restart mid-print.
 
@@ -3831,12 +3894,20 @@ async def _restore_printable_objects(printer_id: int, state, db, logger) -> None
     reload path on ``GET /print/objects`` covers that case on demand.
     """
     client = printer_manager.get_client(printer_id)
-    if client is None or client.state.printable_objects:
+    if client is None or (client.state.printable_objects and client.state.pause_points):
         return
 
     archive = await running_print_archive(db, printer_id, state, printing_only=True, by_name=False)
     if archive is not None and archive.file_path:
-        _load_objects_from_archive(archive, printer_id, logger)
+        if not client.state.printable_objects:
+            _load_objects_from_archive(archive, printer_id, logger)
+        # The slicer's pauses are in-memory only as well (#2984).
+        if not client.state.pause_points:
+            _load_pauses_from_3mf(
+                app_settings.base_dir / archive.file_path,
+                printer_id,
+                warned_layers=pause_eta.warned_layers_of(archive, state),
+            )
 
 
 # Retry ladder for a fallback archive created while the printer's FTPS cool-off
@@ -4014,6 +4085,9 @@ async def _recover_fallback_archive_locked(
             logger.warning(
                 "[RECOVER] Archive %s: could not add the 3MF to Spoolman's usage tracking", archive_id, exc_info=True
             )
+        if price and recovered.status == "printing" and recovered.file_path:
+            # Print start had no 3MF to read the slicer's pauses from (#2984).
+            _load_pauses_from_3mf(app_settings.base_dir / recovered.file_path, printer_id)
         if price and recovered.status == "printing":
             # Print start priced it from the default rate, having no 3MF to
             # estimate from; now it has one. An ended print is left alone: its
@@ -5140,6 +5214,8 @@ async def on_print_start(printer_id: int, data: dict):
 
                 # Extract printable objects from the archived 3MF file
                 _load_objects_from_archive(archive, printer_id, logger)
+                if archive.file_path:
+                    _load_pauses_from_3mf(app_settings.base_dir / archive.file_path, printer_id)
 
                 # Store Spoolman tracking data for per-filament usage reporting
                 try:
@@ -5253,6 +5329,8 @@ async def on_print_start(printer_id: int, data: dict):
                     }
                     await _send_print_start_notification(printer_id, data, archive_data, logger)
                 _load_objects_from_archive(existing_archive, printer_id, logger)
+                if existing_archive.file_path:
+                    _load_pauses_from_resumed_archive(existing_archive, printer_id)
                 return
 
             # Name-match only (no subtask_id to anchor on): decide resume vs.
@@ -5347,6 +5425,8 @@ async def on_print_start(printer_id: int, data: dict):
                     await _send_print_start_notification(printer_id, data, archive_data, logger)
                 # Extract printable objects from the archived 3MF file
                 _load_objects_from_archive(existing_archive, printer_id, logger)
+                if existing_archive.file_path:
+                    _load_pauses_from_resumed_archive(existing_archive, printer_id)
                 return
 
         # Build list of possible 3MF filenames to try
@@ -6209,6 +6289,11 @@ async def on_print_start(printer_id: int, data: dict):
                             )
                 except Exception as e:
                     logger.debug("Failed to extract printable objects: %s", e)
+
+                # From the archived copy: the downloaded one may be removed
+                # below while the pauses are still being read.
+                if archive is not None and archive.file_path:
+                    _load_pauses_from_3mf(app_settings.base_dir / archive.file_path, printer_id)
 
                 # Store Spoolman tracking data for per-filament usage reporting
                 try:
@@ -7154,11 +7239,11 @@ def _is_active_archive_stale(archive, state) -> tuple[bool, str]:
 
     Conservative on purpose: PAUSE / PREPARE / SLICING and any RUNNING state
     with matching subtask_id+subtask_name is left alone. The cost of a false
-    positive is a duplicate archive on the next real PRINT COMPLETE — the
-    reactive handler uses ``_active_prints`` for lookup, which the reconcile
-    clears on synthesis, so the real completion creates a fresh row instead
-    of overwriting the synthesised one (#1679). The cost of a false negative
-    is the ghost-print loop in #1542.
+    positive is a print closed while it still runs: the reconcile takes its
+    ``_active_prints`` entry and the archive is no longer ``printing``, so
+    the real PRINT COMPLETE later finds no archive to close (#1679). The
+    cost of a false negative is the ghost-print loop in #1542. What the
+    archive is closed as is ``_reconciled_outcome``'s call.
 
     Pre-push guard (#1679): when ``state.state`` is empty or ``"unknown"``,
     MQTT has connected but the first ``push_status`` response hasn't been
@@ -7281,6 +7366,71 @@ def _sd_files_in_use(state) -> set[str]:
     return in_use
 
 
+def _reconciled_outcome(archive, state) -> str:
+    """What a stale archive is closed as at reconnect (#3310).
+
+    A print that ends while Bambuddy restarts is never seen to end: the new
+    MQTT client's first status is already FINISH, which is not a transition.
+    The printer keeps reporting the finished job's ``subtask_id`` until the
+    next print, so a matching id proves the FINISH or FAILED is this
+    archive's. Anything else -- IDLE, another job, an id of "0" (a print
+    started outside the cloud) or none -- says only that the print is over,
+    not how, and stays ``aborted``.
+    """
+    current_state = (state.state or "").upper()
+    if current_state not in ("FINISH", "FAILED"):
+        return "aborted"
+    archive_id = (archive.subtask_id or "").strip()
+    current_id = str(state.subtask_id or "").strip()
+    if archive_id in ("", "0") or archive_id != current_id:
+        return "aborted"
+    return "completed" if current_state == "FINISH" else "failed"
+
+
+def _reconciled_end_time(archive, now: datetime, plate_id: int | None = None) -> datetime | None:
+    """When a print reconciled as completed most likely ended, or None (#3310).
+
+    The printer does not say when it finished, and the reconnect can be hours
+    later. Its start plus the slicer's estimate for the plate it printed,
+    never later than now, is the best guess; None when either is missing,
+    and the run then keeps no duration, as an aborted one does.
+
+    ``plate_id`` is the plate this run printed, from its queue job: a reprint
+    of another plate reuses the archive without changing ``archive.plate_id``.
+    """
+    started = archive.started_at
+    if not started:
+        return None
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=timezone.utc)
+    plate = plate_id if plate_id is not None else archive.plate_id
+    estimate = None
+    if archive.file_path:
+        from backend.app.utils.threemf_tools import extract_print_time_from_3mf
+
+        full_path = (
+            app_settings.base_dir / archive.file_path
+        )  # SEC-PATH-OK: archive.file_path is DB-stored, internally generated
+        try:
+            estimate = extract_print_time_from_3mf(full_path, plate)
+        except Exception as exc:  # noqa: BLE001
+            logging.getLogger(__name__).debug(
+                "Plate estimate for reconciled archive %s unreadable: %s", archive.id, exc
+            )
+        if plate is None and estimate != archive.print_time_seconds:
+            # Without a plate the first plate's estimate is read. The archive
+            # carries the sum over all plates (#1593), so a difference means
+            # several plates and no telling which one printed.
+            estimate = None
+    elif plate is None:
+        # Nothing to read the plate from; the archive's own estimate, as for
+        # a single-plate file.
+        estimate = archive.print_time_seconds
+    if not estimate or estimate <= 0:
+        return None
+    return min(started + timedelta(seconds=int(estimate)), now)
+
+
 async def reconcile_stale_active_prints(printer_id: int) -> int:
     """Synthesise ``on_print_complete`` for archives whose print can't be
     running on the printer anymore.
@@ -7297,10 +7447,11 @@ async def reconcile_stale_active_prints(printer_id: int) -> int:
     cleanup chain handles SD-file deletion, status updates, usage tracking,
     and notifications.
 
-    Synthesised ``status="aborted"`` is the conservative label: we have no
-    proof the print finished successfully (and no progress evidence to
-    promote to ``"completed"``). The real PRINT COMPLETE callback, if it
-    fires later, overwrites the status with the correct value.
+    The status is ``_reconciled_outcome``'s: ``completed`` or ``failed``
+    when the printer still reports the archive's own job as finished or
+    failed, ``aborted`` otherwise. Nothing corrects it later: the archive is
+    no longer ``printing``, so a later PRINT COMPLETE finds no archive, and
+    after a restart the printer's FINISH is not one (#3310).
 
     Returns the number of archives reconciled.
     """
@@ -7327,6 +7478,19 @@ async def reconcile_stale_active_prints(printer_id: int) -> int:
     if not active:
         return 0
 
+    # The plate each run printed, from its queue job (#3310).
+    from backend.app.models.print_queue import PrintQueueItem
+
+    async with async_session() as db:
+        plate_rows = await db.execute(
+            select(PrintQueueItem.archive_id, PrintQueueItem.plate_id).where(
+                PrintQueueItem.printer_id == printer_id,
+                PrintQueueItem.status == "printing",
+                PrintQueueItem.archive_id.in_([a.id for a in active]),
+            )
+        )
+        run_plates = {archive_id: plate for archive_id, plate in plate_rows.all() if plate is not None}
+
     logger = logging.getLogger(__name__)
     for archive in active:
         is_stale, reason = _is_active_archive_stale(archive, state)
@@ -7345,18 +7509,30 @@ async def reconcile_stale_active_prints(printer_id: int) -> int:
         # metrics / debug logging). raw_data is the live printer state so
         # the usage tracker can compare end-of-print remain% against the
         # captured start values.
+        outcome = _reconciled_outcome(archive, state)
+        payload = {
+            "status": outcome,
+            "filename": archive.filename,
+            "subtask_name": archive.print_name or "",
+            "subtask_id": archive.subtask_id or "",
+            "raw_data": state.raw_data or {},
+            "_reconciled": True,
+        }
+        if outcome != "aborted":
+            # The printer's progress and layer are this job's, so a partial
+            # run is charged what it printed rather than nothing.
+            if state.progress:
+                payload["last_progress"] = state.progress
+            if state.layer_num:
+                payload["last_layer_num"] = state.layer_num
+        if outcome == "failed":
+            payload["hms_errors"] = [e.completion_payload() for e in state.hms_errors or []]
+        if outcome == "completed":
+            ended = _reconciled_end_time(archive, datetime.now(timezone.utc), run_plates.get(archive.id))
+            if ended:
+                payload["_reconciled_completed_at"] = ended
         try:
-            await on_print_complete(
-                printer_id,
-                {
-                    "status": "aborted",
-                    "filename": archive.filename,
-                    "subtask_name": archive.print_name or "",
-                    "subtask_id": archive.subtask_id or "",
-                    "raw_data": state.raw_data or {},
-                    "_reconciled": True,
-                },
-            )
+            await on_print_complete(printer_id, payload)
             reconciled += 1
         except Exception as e:
             # Catch-all: a reconciliation failure must not block the
@@ -8863,12 +9039,13 @@ async def _close_out_print(printer_id: int, data: dict):
             if hms_errors:
                 logger.info("[ARCHIVE] HMS errors at failure: %s", hms_errors)
             failure_reason = derive_failure_reason(status, hms_errors)
-            if data.get("_reconciled"):
+            if data.get("_reconciled") and (status == "aborted" or (status == "failed" and not failure_reason)):
                 # A reconciled completion closes out a stale archive at
                 # reconnect — it is not a user action, so don't mislabel it
                 # "userCancelled". It shares the stale-cleanup path's key
                 # (issue #2974) and records that the real end time is unknown,
-                # which is also why its logged duration is 0 (#2592).
+                # which is also why its logged duration is 0 (#2592). A failed
+                # one the printer's errors explain keeps their reason (#3310).
                 failure_reason = "noStatusUpdate"
             elif data.get("_kill_switch"):
                 # Not the user's cancel: the kill switch stopped a print that did
@@ -8883,7 +9060,11 @@ async def _close_out_print(printer_id: int, data: dict):
                 archive_id,
                 status=status,
                 completed_at=(
-                    datetime.now(timezone.utc) if status in ("completed", "failed", "aborted", "cancelled") else None
+                    # A reconciled completed print ended at an estimated time,
+                    # not at the reconnect (#3310).
+                    data.get("_reconciled_completed_at") or datetime.now(timezone.utc)
+                    if status in ("completed", "failed", "aborted", "cancelled")
+                    else None
                 ),
                 failure_reason=failure_reason,
             )
@@ -9095,8 +9276,11 @@ async def _close_out_print(printer_id: int, data: dict):
                     created_by_id=archive.created_by_id,
                     created_by_username=_print_user_info.get("username") if _print_user_info else None,
                     # Reconciled completions have an unknown real end time —
-                    # log 0 duration instead of the whole disconnect gap (#2592).
-                    reconciled=bool(data.get("_reconciled")),
+                    # log 0 duration instead of the whole disconnect gap (#2592),
+                    # unless it was estimated (#3310).
+                    reconciled=bool(data.get("_reconciled")) and not data.get("_reconciled_completed_at"),
+                    # Its time is the estimate or nothing, never measured (#3310).
+                    duration_unmeasured=bool(data.get("_reconciled")),
                 )
                 await record_archive_wear(db, archive, run_entry)
                 await db.commit()
@@ -9523,7 +9707,12 @@ async def _close_out_print(printer_id: int, data: dict):
                         # print ended while the printer was offline and
                         # completed_at is the reconnect, so the gap would read
                         # as the duration -- 14 h for a night offline (DB-C9).
-                        if archive.started_at and archive.completed_at and not data.get("_reconciled"):
+                        # An estimated end (#3310) gives the estimate.
+                        if (
+                            archive.started_at
+                            and archive.completed_at
+                            and (not data.get("_reconciled") or data.get("_reconciled_completed_at"))
+                        ):
                             elapsed = (archive.completed_at - archive.started_at).total_seconds()
                             if elapsed > 0:
                                 actual_time_seconds = int(elapsed)
